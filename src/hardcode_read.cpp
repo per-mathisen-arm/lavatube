@@ -647,7 +647,8 @@ const char* const* device_extensions(VkDeviceCreateInfo* sptr, lava_file_reader&
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
 		VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME,
 		VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, VK_TRACETOOLTEST_CHECKSUM_VALIDATION_EXTENSION_NAME,
-		VK_TRACETOOLTEST_OBJECT_PROPERTY_EXTENSION_NAME, VK_EXT_TOOLING_INFO_EXTENSION_NAME
+		VK_TRACETOOLTEST_OBJECT_PROPERTY_EXTENSION_NAME, VK_EXT_TOOLING_INFO_EXTENSION_NAME,
+		VK_TRACETOOLTEST_TRACE_HELPERS_EXTENSION_NAME
 	};
 
 	dst.clear();
@@ -985,6 +986,202 @@ void retrace_vkAssertBufferTRACETOOLTEST(lava_file_reader& reader)
 	NEVER("buffer %u validation size=%u off=%u origchecksum=%u newchecksum=%u [first byte is %u, last byte is %u]", buffer_index, (unsigned)tbuf.size, (unsigned)loc.offset, checksum, checksum_new, ptr[0], ptr[tbuf.size-1]);
 	wrap_vkUnmapMemory(device, loc.memory);
 	assert(checksum == checksum_new || is_blackhole_mode());
+}
+
+void read_VkAddressRemapTRACETOOLTEST(lava_file_reader& reader, VkAddressRemapTRACETOOLTEST* sptr)
+{
+	sptr->sType = (VkStructureType)reader.read_uint32_t();
+	assert(sptr->sType == VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+	read_extension(reader, (VkBaseOutStructure**)&sptr->pNext);
+	sptr->target = (VkAddressRemapTargetTRACETOOLTEST)reader.read_uint32_t();
+	sptr->count = reader.read_uint32_t();
+	const bool pOffsets_opt = reader.read_uint8_t();
+	sptr->pOffsets = nullptr;
+	if (pOffsets_opt)
+	{
+		VkDeviceSize* backing = reader.pool.allocate<VkDeviceSize>(sptr->count);
+		memset(backing, 0, sptr->count * sizeof(VkDeviceSize));
+		reader.read_array(backing, sptr->count);
+		sptr->pOffsets = backing;
+	}
+	ILOG("Got a memory markup struct with count %lu", (unsigned long)sptr->count);
+}
+
+static void translate_addresses(lava_file_reader& reader, uint32_t count, VkDeviceSize* pOffsets, void* ptr)
+{
+	for (uint32_t i = 0; i < count; i++)
+	{
+		const uint64_t offset = pOffsets[i];
+		uint64_t* addr = (uint64_t*)(((char*)ptr) + offset);
+		const uint64_t current = *addr;
+		const trackedbuffer* buffer_data = reader.parent->buffer_device_address_remapping.at(current);
+		const uint64_t newval = buffer_data->buffer_device_address;
+		ILOG("%u: Changing memory value at offset %lu from %lu to %lu", (unsigned)i, (unsigned long)offset, (unsigned long)current, (unsigned long)newval);
+		*addr = newval;
+	}
+}
+
+static char* mem_map(lava_file_reader& reader, VkDevice device, const suballoc_location& loc)
+{
+	char* ptr = nullptr;
+	VkResult result = wrap_vkMapMemory(device, loc.memory, loc.offset, loc.size, 0, (void**)&ptr);
+	assert(result == VK_SUCCESS);
+	if (loc.needs_init)
+	{
+		memset(ptr, 0, loc.size);
+	}
+	return ptr;
+}
+
+static void mem_unmap(lava_file_reader& reader, VkDevice device, const suballoc_location& loc, VkAddressRemapTRACETOOLTEST* ar, char* ptr)
+{
+	if (ar) translate_addresses(reader, ar->count, ar->pOffsets, ptr);
+	if (loc.needs_flush)
+	{
+		VkMappedMemoryRange flush = {};
+		flush.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+		flush.memory = loc.memory;
+		flush.offset = loc.offset;
+		flush.size = loc.size;
+		wrap_vkFlushMappedMemoryRanges(device, 1, &flush);
+	}
+	wrap_vkUnmapMemory(device, loc.memory);
+}
+
+VKAPI_ATTR void retrace_vkThreadBarrierTRACETOOLTEST(lava_file_reader& reader)
+{
+// TBD TBD TODO TBD TBD -- count was uint8_t, now we defined it as uint32_t!
+	reader.read_barrier();
+}
+
+VKAPI_ATTR void retrace_vkUpdateBufferTRACETOOLTEST(lava_file_reader& reader)
+{
+	// Read
+	const uint32_t device_index = reader.read_handle();
+	const uint32_t buffer_index = reader.read_handle();
+	VkUpdateMemoryInfoTRACETOOLTEST info = {};
+	read_VkUpdateMemoryInfoTRACETOOLTEST(reader, &info);
+
+	// Lookup
+	VkDevice device = index_to_VkDevice.at(device_index);
+	trackedobject& tbuf = VkBuffer_index.at(buffer_index);
+	suballoc_location loc = suballoc_find_buffer_memory(buffer_index);
+	VkAddressRemapTRACETOOLTEST* ar = (VkAddressRemapTRACETOOLTEST*)find_extension(&info, (VkStructureType)VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+
+	// Verify
+	assert(info.pData);
+	assert(loc.memory);
+	assert(tbuf.size);
+
+	// Act
+	char* ptr = mem_map(reader, device, loc);
+	memcpy(ptr, info.pData, info.dataSize);
+	mem_unmap(reader, device, loc, ar, ptr);
+}
+
+VKAPI_ATTR void retrace_vkUpdateImageTRACETOOLTEST(lava_file_reader& reader)
+{
+	const uint32_t device_index = reader.read_handle();
+	const uint32_t image_index = reader.read_handle();
+	VkUpdateMemoryInfoTRACETOOLTEST info = {};
+	read_VkUpdateMemoryInfoTRACETOOLTEST(reader, &info);
+
+	// Lookup
+	VkDevice device = index_to_VkDevice.at(device_index);
+	trackedimage& timg = VkImage_index.at(image_index);
+	suballoc_location loc = suballoc_find_image_memory(image_index);
+	VkAddressRemapTRACETOOLTEST* ar = (VkAddressRemapTRACETOOLTEST*)find_extension(&info, VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+
+	// Verify
+	assert(info.pData);
+	assert(loc.memory);
+	assert(timg.size);
+
+	// Act
+	char* ptr = mem_map(reader, device, loc);
+	memcpy(ptr, info.pData, info.dataSize);
+	mem_unmap(reader, device, loc, ar, ptr);
+}
+
+VKAPI_ATTR void retrace_vkPatchBufferTRACETOOLTEST(lava_file_reader& reader)
+{
+	const uint32_t device_index = reader.read_handle();
+	const uint32_t buffer_index = reader.read_handle();
+	VkUpdateMemoryInfoTRACETOOLTEST info = {};
+	read_VkUpdateMemoryInfoTRACETOOLTEST(reader, &info);
+
+	// Lookup
+	VkDevice device = index_to_VkDevice.at(device_index);
+	trackedobject& tbuf = VkBuffer_index.at(buffer_index);
+	suballoc_location loc = suballoc_find_buffer_memory(buffer_index);
+	VkAddressRemapTRACETOOLTEST* ar = (VkAddressRemapTRACETOOLTEST*)find_extension(&info, VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+
+	// Verify
+	assert(info.pData);
+	assert(loc.memory);
+	assert(tbuf.size);
+
+	// Act
+	char* ptr = mem_map(reader, device, loc);
+	int32_t changed = reader.read_patch(ptr, loc.size);
+	mem_unmap(reader, device, loc, ar, ptr);
+}
+
+VKAPI_ATTR void retrace_vkPatchImageTRACETOOLTEST(lava_file_reader& reader)
+{
+	const uint32_t device_index = reader.read_handle();
+	const uint32_t image_index = reader.read_handle();
+	VkUpdateMemoryInfoTRACETOOLTEST info = {};
+	read_VkUpdateMemoryInfoTRACETOOLTEST(reader, &info);
+
+	// Lookup
+	VkDevice device = index_to_VkDevice.at(device_index);
+	trackedimage& timg = VkImage_index.at(image_index);
+	suballoc_location loc = suballoc_find_image_memory(image_index);
+	VkAddressRemapTRACETOOLTEST* ar = (VkAddressRemapTRACETOOLTEST*)find_extension(&info, VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+
+	// Verify
+	assert(info.pData);
+	assert(loc.memory);
+	assert(timg.size);
+
+	// Act
+	char* ptr = mem_map(reader, device, loc);
+	memcpy(ptr, info.pData, info.dataSize);
+	mem_unmap(reader, device, loc, ar, ptr);
+}
+
+void read_VkUpdateMemoryInfoTRACETOOLTEST(lava_file_reader& reader, VkUpdateMemoryInfoTRACETOOLTEST* sptr)
+{
+	sptr->sType = (VkStructureType)reader.read_uint32_t();
+	assert(sptr->sType == VK_STRUCTURE_TYPE_UPDATE_MEMORY_INFO_TRACETOOLTEST);
+	read_extension(reader, (VkBaseOutStructure**)&sptr->pNext);
+	uint32_t buffer_index = reader.read_handle();
+	sptr->dstOffset = reader.read_uint64_t();
+	sptr->dataSize = reader.read_uint64_t();
+	uint8_t pData_opt = reader.read_uint8_t();
+	if (pData_opt)
+	{
+		uint8_t* backing = reader.pool.allocate<uint8_t>(sptr->dataSize);
+		memset(backing, 0, sptr->dataSize);
+		reader.read_array(backing, sptr->dataSize);
+		sptr->pData = backing;
+	}
+}
+
+VKAPI_ATTR void retrace_vkCmdUpdateBuffer2TRACETOOLTEST(lava_file_reader& reader)
+{
+	VkUpdateMemoryInfoTRACETOOLTEST info = {};
+	const uint32_t commandbuffer_index = reader.read_handle();
+	const uint32_t buffer_index = reader.read_handle();
+	VkBuffer dstBuffer = index_to_VkBuffer.at(buffer_index);
+	VkCommandBuffer commandBuffer = index_to_VkCommandBuffer.at(commandbuffer_index);
+	read_VkUpdateMemoryInfoTRACETOOLTEST(reader, &info);
+	VkAddressRemapTRACETOOLTEST* ar = (VkAddressRemapTRACETOOLTEST*)find_extension(&info, VK_STRUCTURE_TYPE_ADDRESS_REMAP_TRACETOOLTEST);
+	// -- Execute --
+	if (ar) translate_addresses(reader, ar->count, ar->pOffsets, const_cast<void*>(info.pData));
+	wrap_vkCmdUpdateBuffer(commandBuffer, dstBuffer, info.dstOffset, info.dataSize, info.pData);
+	ILOG("Ran vkCmdUpdateBuffer2TRACETOOLTEST"); // TBD REMOVE ME
 }
 
 void retrace_vkCmdBuildAccelerationStructuresIndirectKHR(lava_file_reader& reader)
@@ -1807,42 +2004,26 @@ static trackedrenderpass trackedrenderpass_json(const Json::Value& v)
 }
 
 
-// --- read helpers ---
-
-void static post_update(lava_file_reader& reader, VkDevice device, const suballoc_location& loc)
-{
-	char* ptr = nullptr;
-	VkResult result = wrap_vkMapMemory(device, loc.memory, loc.offset, loc.size, 0, (void**)&ptr);
-	assert(result == VK_SUCCESS);
-	if (loc.needs_init)
-	{
-		memset(ptr, 0, loc.size);
-	}
-	uint32_t changed = reader.read_patch(ptr, loc.size);
-	if (loc.needs_flush)
-	{
-		VkMappedMemoryRange flush = {};
-		flush.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-		flush.memory = loc.memory;
-		flush.offset = loc.offset;
-		flush.size = loc.size;
-		wrap_vkFlushMappedMemoryRanges(device, 1, &flush);
-	}
-	wrap_vkUnmapMemory(device, loc.memory);
-}
+// --- read helpers : legacy code ---
 
 void image_update(lava_file_reader& reader, uint32_t device_index, uint32_t image_index)
 {
 	suballoc_location loc = suballoc_find_image_memory(image_index);
 	DLOG2("image update idx=%u flush=%s init=%s size=%lu", image_index, loc.needs_flush ? "yes" : "no", loc.needs_init ? "yes" : "no", (unsigned long)loc.size);
-	post_update(reader, index_to_VkDevice.at(device_index), loc);
+	VkDevice device = index_to_VkDevice.at(device_index);
+	char* ptr = mem_map(reader, device, loc);
+	int32_t changed = reader.read_patch(ptr, loc.size);
+	mem_unmap(reader, device, loc, nullptr, ptr);
 }
 
 void buffer_update(lava_file_reader& reader, uint32_t device_index, uint32_t buffer_index)
 {
 	suballoc_location loc = suballoc_find_buffer_memory(buffer_index);
 	DLOG2("buffer update idx=%u flush=%s init=%s size=%lu", buffer_index, loc.needs_flush ? "yes" : "no", loc.needs_init ? "yes" : "no", (unsigned long)loc.size);
-	post_update(reader, index_to_VkDevice.at(device_index), loc);
+	VkDevice device = index_to_VkDevice.at(device_index);
+	char* ptr = mem_map(reader, device, loc);
+	int32_t changed = reader.read_patch(ptr, loc.size);
+	mem_unmap(reader, device, loc, nullptr, ptr);
 }
 
 // -- terminate everything cleanly
